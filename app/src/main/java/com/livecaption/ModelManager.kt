@@ -3,6 +3,8 @@ package com.livecaption
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.vosk.Model
 import org.vosk.Recognizer
 import java.io.*
@@ -10,27 +12,10 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.zip.ZipInputStream
 
-/**
- * ModelManager mirrors the desktop main.go model acquisition flow:
- *
- *   1. Check if the model directory already exists on the internal filesystem.
- *      - Healthy → load directly.
- *      - Corrupt (sentinel file missing) → delete and re-download.
- *   2. Download the ZIP with progress callbacks.
- *   3. Extract atomically: write to a .tmp directory, rename to final on success.
- *   4. Verify integrity with a sentinel file written at the end of extraction.
- *   5. Instantiate org.vosk.Model + Recognizer and call onModelReady.
- *
- * Language registry mirrors voskModels in main.go.
- *
- * Thread-safety: all public functions are safe to call from any coroutine.
- * Internal state is protected by [modelMutex].
- */
 object ModelManager {
 
-    private const val TAG = "ModelManager"
+    private const val TAG = "LC_ModelManager"
 
-    // ── Language registry — mirrors voskModels in main.go ────────────────────
     data class ModelInfo(val folder: String, val url: String)
 
     val LANGUAGES = mapOf(
@@ -56,260 +41,258 @@ object ModelManager {
             "https://alphacephei.com/vosk/models/vosk-model-small-hi-0.22.zip"),
     )
 
-    // ── Sentinel filename written after successful extraction ─────────────────
-    // Mirrors model.IsCorrupt() in Go: if this file is absent the dir is corrupt.
     private const val SENTINEL = ".vosk_model_ok"
 
-    // ── Mutex protecting activeModel / activeRecognizer ───────────────────────
-    private val modelMutex = kotlinx.coroutines.sync.Mutex()
+    private val modelMutex = Mutex()
     private var activeModel:      Model?      = null
     private var activeRecognizer: Recognizer? = null
 
-    // ── Callbacks (set by VoskEngine) ─────────────────────────────────────────
+    @Volatile private var recognizerSnapshot: Recognizer? = null
+
     var onProgress:   ((lang: String, percent: Int) -> Unit)? = null
     var onModelReady: ((lang: String) -> Unit)?               = null
     var onError:      ((msg: String) -> Unit)?                = null
 
-    // ── Coroutine scope for downloads (cancellable per switch) ────────────────
     private var downloadJob: Job? = null
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Public API
-    // ─────────────────────────────────────────────────────────────────────────
+    fun getRecognizer(): Recognizer? = recognizerSnapshot
 
-    /**
-     * Load or download the model for [lang]. Mirrors downloadModelWithProgress in main.go.
-     * Cancels any in-flight download before starting a new one.
-     */
     fun switchLanguage(context: Context, lang: String, scope: CoroutineScope) {
+        Log.i(TAG, "switchLanguage($lang) — launching download/load job")
         downloadJob?.cancel()
         downloadJob = scope.launch(Dispatchers.IO) {
             loadOrDownload(context, lang)
         }
     }
 
-    /**
-     * Returns the currently active Recognizer, or null if no model is loaded.
-     * Caller must NOT hold the recognizer across a language switch; always
-     * call this per-chunk.
-     */
     suspend fun withRecognizer(block: (Recognizer) -> Unit) {
-        modelMutex.withLock {
-            activeRecognizer?.let { block(it) }
-        }
+        val rec = modelMutex.withLock { activeRecognizer } ?: return
+        block(rec)
     }
 
-    /**
-     * Create a fresh Recognizer from the currently loaded model.
-     * Used for file transcription (mirrors fileRec in main.go).
-     * Returns null if no model is loaded.
-     */
     suspend fun createFileRecognizer(sampleRate: Float): Recognizer? =
         modelMutex.withLock { activeModel?.let { Recognizer(it, sampleRate) } }
 
-    /** Release active model + recognizer. */
     suspend fun shutdown() {
+        Log.i(TAG, "shutdown()")
         modelMutex.withLock {
+            recognizerSnapshot = null
             activeRecognizer?.close()
             activeModel?.close()
             activeRecognizer = null
-            activeModel = null
+            activeModel      = null
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Internal — load or download
-    // ─────────────────────────────────────────────────────────────────────────
-
     private suspend fun loadOrDownload(context: Context, lang: String) {
+        Log.i(TAG, "loadOrDownload($lang) start — thread=${Thread.currentThread().name}")
+
         val info = LANGUAGES[lang] ?: run {
-            onError?.invoke("Unknown language: $lang")
-            return
+            Log.e(TAG, "Unknown language: $lang")
+            onError?.invoke("Unknown language: $lang"); return
         }
 
-        // Models are stored in the app's private files directory —
-        // no storage permission needed, never cleared by the OS while app is installed.
-        val modelsDir = File(context.filesDir, "vosk_models")
-        modelsDir.mkdirs()
-
+        val modelsDir = File(context.filesDir, "vosk_models").also {
+            it.mkdirs()
+            Log.i(TAG, "Models dir: ${it.absolutePath} exists=${it.exists()}")
+        }
         val modelDir = File(modelsDir, info.folder)
+        Log.i(TAG, "Expected model dir: ${modelDir.absolutePath} exists=${modelDir.exists()}")
 
-        // ── Integrity check ───────────────────────────────────────────────────
         if (modelDir.exists()) {
-            if (File(modelDir, SENTINEL).exists()) {
-                Log.i(TAG, "Model $lang already on disk — loading")
+            val sentinel = File(modelDir, SENTINEL)
+            Log.i(TAG, "Model dir exists — sentinel=${sentinel.exists()}")
+            if (sentinel.exists()) {
+                val contents = modelDir.listFiles()?.map { it.name } ?: emptyList()
+                Log.i(TAG, "Model dir contents (${contents.size} files): $contents")
                 loadModel(lang, modelDir)
                 return
             } else {
-                Log.w(TAG, "Model dir exists but is corrupt — removing for re-download")
+                Log.w(TAG, "No sentinel — corrupt model dir, deleting for re-download")
                 modelDir.deleteRecursively()
             }
         }
 
-        // ── Clean stale tmp artefacts ─────────────────────────────────────────
-        File(modelsDir, "${info.folder}.tmp").deleteRecursively()
-        File(modelsDir, "${info.folder}.zip").delete()
+        // Clean stale artefacts
+        File(modelsDir, "${info.folder}.tmp").also {
+            if (it.exists()) { Log.i(TAG, "Deleting stale .tmp dir"); it.deleteRecursively() }
+        }
+        File(modelsDir, "${info.folder}.zip").also {
+            if (it.exists()) { Log.i(TAG, "Deleting stale .zip"); it.delete() }
+        }
 
-        // ── Download ──────────────────────────────────────────────────────────
+        Log.i(TAG, "Starting download from ${info.url}")
         onProgress?.invoke(lang, 0)
 
         val zipFile = File(modelsDir, "${info.folder}.zip")
         try {
-            downloadFile(lang, info.url, zipFile) { percent ->
-                onProgress?.invoke(lang, percent)
+            downloadFile(lang, info.url, zipFile) { pct ->
+                onProgress?.invoke(lang, pct)
             }
+            Log.i(TAG, "Download complete — zip size=${zipFile.length()} bytes")
         } catch (e: CancellationException) {
-            zipFile.delete()
-            throw e     // propagate cancellation cleanly
+            zipFile.delete(); throw e
         } catch (e: Exception) {
+            Log.e(TAG, "Download failed", e)
             zipFile.delete()
-            onError?.invoke("Download failed: ${e.message}")
-            return
+            onError?.invoke("Download failed: ${e.message}"); return
         }
 
-        // ── Extract ───────────────────────────────────────────────────────────
-        onProgress?.invoke(lang, 100)   // signal "extracting"
+        Log.i(TAG, "Starting extraction to ${modelsDir.absolutePath}")
+        onProgress?.invoke(lang, 100)
         val tmpDir = File(modelsDir, "${info.folder}.tmp")
         try {
             extractZip(zipFile, tmpDir)
+            Log.i(TAG, "Extraction complete — tmpDir contents: ${tmpDir.listFiles()?.map { it.name }}")
         } catch (e: CancellationException) {
-            tmpDir.deleteRecursively()
-            zipFile.delete()
-            throw e
+            tmpDir.deleteRecursively(); zipFile.delete(); throw e
         } catch (e: Exception) {
-            tmpDir.deleteRecursively()
-            zipFile.delete()
-            onError?.invoke("Extraction failed: ${e.message}")
-            return
+            Log.e(TAG, "Extraction failed", e)
+            tmpDir.deleteRecursively(); zipFile.delete()
+            onError?.invoke("Extraction failed: ${e.message}"); return
         }
 
         zipFile.delete()
 
-        // The ZIP contains a single top-level directory (the model folder).
-        // Find it and rename it to the final location.
-        val extractedRoot = tmpDir.listFiles()?.firstOrNull { it.isDirectory }
-            ?: tmpDir   // fallback: files were extracted directly into tmpDir
+        val extractedRoot = tmpDir.listFiles()
+            ?.firstOrNull { it.isDirectory && !it.name.startsWith(".") }
+            ?: tmpDir
+        Log.i(TAG, "Extracted root: ${extractedRoot.absolutePath}")
+        Log.i(TAG, "Extracted root contents: ${extractedRoot.listFiles()?.map { it.name }}")
 
-        // Write sentinel BEFORE rename so if rename succeeds, integrity is guaranteed.
         File(extractedRoot, SENTINEL).createNewFile()
 
-        // Atomic rename
-        if (!extractedRoot.renameTo(modelDir)) {
-            // renameTo can fail across mount points (shouldn't happen in filesDir).
-            // Fallback: copy then delete.
+        val renamed = extractedRoot.renameTo(modelDir)
+        Log.i(TAG, "renameTo modelDir: success=$renamed")
+        if (!renamed) {
+            Log.w(TAG, "renameTo failed — falling back to copyRecursively")
             extractedRoot.copyRecursively(modelDir, overwrite = true)
-            tmpDir.deleteRecursively()
-        } else {
-            tmpDir.deleteRecursively()
         }
+        tmpDir.deleteRecursively()
+
+        Log.i(TAG, "Final model dir: ${modelDir.absolutePath} exists=${modelDir.exists()}")
+        Log.i(TAG, "Final model dir contents: ${modelDir.listFiles()?.map { it.name }}")
 
         loadModel(lang, modelDir)
     }
 
     private suspend fun loadModel(lang: String, modelDir: File) {
-        Log.i(TAG, "Loading Vosk model from ${modelDir.absolutePath}")
+        Log.i(TAG, "loadModel($lang) from ${modelDir.absolutePath}")
+
+        val contents = modelDir.listFiles()
+        if (contents.isNullOrEmpty()) {
+            Log.e(TAG, "Model dir is EMPTY — extraction may have failed silently")
+            onError?.invoke("Model files missing. Please try again.")
+            modelDir.deleteRecursively()
+            return
+        }
+        Log.i(TAG, "Model dir has ${contents.size} entries: ${contents.map { it.name }}")
+
+        // Vosk requires these key files/dirs to exist
+        val required = listOf("am", "conf", "graph")
+        val missing  = required.filter { name -> contents.none { it.name == name } }
+        if (missing.isNotEmpty()) {
+            Log.e(TAG, "Model dir missing required entries: $missing")
+            Log.e(TAG, "This usually means the ZIP extracted into a wrong directory level.")
+            // Try one level deeper
+            val subDir = contents.firstOrNull { it.isDirectory && !it.name.startsWith(".") }
+            if (subDir != null) {
+                Log.i(TAG, "Trying sub-directory: ${subDir.absolutePath}")
+                loadModel(lang, subDir)
+                return
+            }
+            onError?.invoke("Model structure invalid. Please try again.")
+            modelDir.deleteRecursively()
+            return
+        }
+
+        Log.i(TAG, "Model structure looks valid — calling Model(${modelDir.absolutePath})")
         try {
-            val newModel = withContext(Dispatchers.IO) { Model(modelDir.absolutePath) }
-            val newRec   = Recognizer(newModel, AudioCapture.SAMPLE_RATE.toFloat())
+            val newModel = withContext(Dispatchers.IO) {
+                Log.i(TAG, "Model() constructor starting on ${Thread.currentThread().name}")
+                val m = Model(modelDir.absolutePath)
+                Log.i(TAG, "Model() constructor returned")
+                m
+            }
+            Log.i(TAG, "Creating Recognizer at ${AudioCapture.SAMPLE_RATE}Hz")
+            val newRec = Recognizer(newModel, AudioCapture.SAMPLE_RATE.toFloat())
+            Log.i(TAG, "Recognizer created successfully")
 
             modelMutex.withLock {
                 activeRecognizer?.close()
                 activeModel?.close()
-                activeRecognizer = newRec
-                activeModel      = newModel
+                activeRecognizer   = newRec
+                activeModel        = newModel
+                recognizerSnapshot = newRec
             }
 
-            Log.i(TAG, "Model $lang ready")
+            Log.i(TAG, "=== MODEL READY: $lang ===")
             onModelReady?.invoke(lang)
+
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to load model", e)
+            Log.e(TAG, "Model() or Recognizer() constructor threw: ${e.message}", e)
+            modelDir.deleteRecursively()
             onError?.invoke("Failed to load model: ${e.message}")
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Download helper — reports byte-level progress
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private fun downloadFile(
-        lang: String,
-        urlStr: String,
-        dest: File,
-        onPercent: (Int) -> Unit
-    ) {
-        val url  = URL(urlStr)
-        val conn = url.openConnection() as HttpURLConnection
-        conn.connectTimeout = 15_000
-        conn.readTimeout    = 60_000
-        conn.connect()
-
+    private fun downloadFile(lang: String, urlStr: String, dest: File, onPercent: (Int) -> Unit) {
+        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout    = 60_000
+            connect()
+        }
+        Log.i(TAG, "HTTP response: ${conn.responseCode} for $urlStr")
         if (conn.responseCode != HttpURLConnection.HTTP_OK) {
             conn.disconnect()
-            throw IOException("HTTP ${conn.responseCode} downloading $lang model")
+            throw IOException("HTTP ${conn.responseCode} for $lang model")
         }
-
-        val total = conn.contentLengthLong
+        val total      = conn.contentLengthLong
         var downloaded = 0L
-        var lastPercent = -1
-
+        var lastPct    = -1
         conn.inputStream.use { input ->
             FileOutputStream(dest).use { output ->
-                val buf = ByteArray(8 * 1024)
+                val buf = ByteArray(8192)
                 while (true) {
                     val n = input.read(buf)
                     if (n < 0) break
                     output.write(buf, 0, n)
                     downloaded += n
                     if (total > 0) {
-                        val pct = ((downloaded * 99) / total).toInt()   // cap at 99; 100 = extracting
-                        if (pct != lastPercent) {
-                            lastPercent = pct
-                            onPercent(pct)
-                        }
+                        val pct = ((downloaded * 99) / total).toInt()
+                        if (pct != lastPct) { lastPct = pct; onPercent(pct) }
                     }
-                    // Allow coroutine cancellation between chunks
-                    if (Thread.currentThread().isInterrupted) throw CancellationException("Download cancelled")
+                    if (Thread.currentThread().isInterrupted)
+                        throw CancellationException("Download cancelled")
                 }
             }
         }
-
         conn.disconnect()
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // ZIP extraction helper
-    // ─────────────────────────────────────────────────────────────────────────
-
     private fun extractZip(zipFile: File, destDir: File) {
         destDir.mkdirs()
+        var entryCount = 0
         ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
             var entry = zis.nextEntry
             while (entry != null) {
+                entryCount++
                 val outFile = File(destDir, entry.name)
                 if (entry.isDirectory) {
                     outFile.mkdirs()
                 } else {
                     outFile.parentFile?.mkdirs()
                     FileOutputStream(outFile).use { out ->
-                        val buf = ByteArray(8 * 1024)
-                        while (true) {
-                            val n = zis.read(buf)
-                            if (n < 0) break
-                            out.write(buf, 0, n)
-                        }
+                        val buf = ByteArray(8192)
+                        while (true) { val n = zis.read(buf); if (n < 0) break; out.write(buf, 0, n) }
                     }
                 }
                 zis.closeEntry()
                 entry = zis.nextEntry
-
-                if (Thread.currentThread().isInterrupted) throw CancellationException("Extraction cancelled")
+                if (Thread.currentThread().isInterrupted)
+                    throw CancellationException("Extraction cancelled")
             }
         }
+        Log.i(TAG, "Extracted $entryCount ZIP entries to ${destDir.absolutePath}")
     }
-}
-
-// ── Convenience extension on Mutex (not in older coroutines stdlib) ───────────
-private suspend fun <T> kotlinx.coroutines.sync.Mutex.withLock(block: suspend () -> T): T {
-    lock()
-    return try { block() } finally { unlock() }
 }

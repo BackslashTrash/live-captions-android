@@ -3,9 +3,15 @@ package com.livecaption
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.util.Log
 import android.view.*
 import androidx.compose.runtime.Recomposer
 import androidx.compose.ui.platform.AndroidUiDispatcher
@@ -60,9 +66,13 @@ class OverlayService : Service(),
     companion object {
         const val NOTIF_CHANNEL_ID = "livecaption_overlay"
         const val NOTIF_ID = 1
+        private const val TAG = "LC_OverlayService"
 
         @Volatile var activeViewModel: CaptionViewModel? = null
             private set
+
+        // Instance reference so trampoline activities can reach the running service.
+        @Volatile private var instance: OverlayService? = null
 
         fun start(context: Context) {
             val intent = Intent(context, OverlayService::class.java)
@@ -74,6 +84,15 @@ class OverlayService : Service(),
 
         fun stop(context: Context) =
             context.stopService(Intent(context, OverlayService::class.java))
+
+        /**
+         * Called by MediaProjectionActivity with the consent dialog result.
+         * Forwards to the running service instance (no-op if service is gone).
+         */
+        fun onProjectionResult(resultCode: Int, data: Intent?) {
+            instance?.handleProjectionResult(resultCode, data)
+                ?: Log.w(TAG, "onProjectionResult but service not running")
+        }
     }
 
     // ── LifecycleOwner / ViewModelStoreOwner / SavedStateRegistryOwner ────────
@@ -106,6 +125,7 @@ class OverlayService : Service(),
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         savedStateController.performRestore(null)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
 
@@ -115,8 +135,12 @@ class OverlayService : Service(),
         )[CaptionViewModel::class.java]
         activeViewModel = viewModel
 
+        // Wire the projection request: the toggle button asks the ViewModel,
+        // the ViewModel asks us, we launch the consent trampoline.
+        viewModel.onRequestProjection = { MediaProjectionActivity.launch(this) }
+
         createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification())
+        startForegroundCompat(withProjection = false)
 
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
 
@@ -135,12 +159,89 @@ class OverlayService : Service(),
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         activeViewModel = null
+        instance = null
+        projection?.stop()
+        projection = null
         removeAllWindows()
         vmStore.clear()
         serviceScope.cancel()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MediaProjection (device audio capture)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private var projection: MediaProjection? = null
+
+    /**
+     * Receives the consent result from MediaProjectionActivity.
+     *
+     * Order matters on API 29+ (strictly enforced on 34+):
+     *   1. startForeground with FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION active
+     *   2. THEN getMediaProjection(resultCode, data)
+     *   3. THEN registerCallback (mandatory on 34+ before capture starts)
+     * Doing these out of order throws SecurityException / IllegalStateException.
+     */
+    private fun handleProjectionResult(resultCode: Int, data: Intent?) {
+        if (resultCode != Activity.RESULT_OK || data == null) {
+            Log.i(TAG, "Projection consent denied / cancelled")
+            // Stay on mic — no state change needed, just inform the user.
+            activeViewModel?.let { /* mic remains active; nothing to undo */ }
+            return
+        }
+
+        try {
+            // 1. Upgrade foreground type BEFORE getMediaProjection
+            startForegroundCompat(withProjection = true)
+
+            // 2. Obtain the projection from the one-time consent token
+            val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val proj = mpm.getMediaProjection(resultCode, data)
+            if (proj == null) {
+                Log.e(TAG, "getMediaProjection returned null")
+                return
+            }
+
+            // 3. Register callback (required on API 34+ before starting capture).
+            //    onStop fires when the user revokes via the status bar chip or
+            //    the system kills the projection — fall back to mic cleanly.
+            proj.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    Log.i(TAG, "MediaProjection stopped by system/user — reverting to mic")
+                    projection = null
+                    viewModel.switchToMic()
+                    startForegroundCompat(withProjection = false)
+                }
+            }, Handler(Looper.getMainLooper()))
+
+            projection?.stop()   // release any previous session
+            projection = proj
+            viewModel.switchToDevice(proj)
+            Log.i(TAG, "Projection granted — device audio capture starting")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Projection setup failed: ${e.message}", e)
+            startForegroundCompat(withProjection = false)
+        }
+    }
+
+    /**
+     * startForeground with explicit service types on API 29+.
+     * The mediaProjection type may only be active while a projection session
+     * is in use; we drop back to microphone-only when it ends.
+     */
+    private fun startForegroundCompat(withProjection: Boolean) {
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            if (withProjection) types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            startForeground(NOTIF_ID, notification, types)
+        } else {
+            startForeground(NOTIF_ID, notification)
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Window 1: Caption bar — draggable, WRAP_CONTENT, bottom-center initially
@@ -337,9 +438,4 @@ class OverlayService : Service(),
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
-}
-
-// ── Mutex extension (local to this file) ──────────────────────────────────────
-private suspend fun <T> kotlinx.coroutines.sync.Mutex.withLock(block: suspend () -> T): T {
-    lock(); return try { block() } finally { unlock() }
 }

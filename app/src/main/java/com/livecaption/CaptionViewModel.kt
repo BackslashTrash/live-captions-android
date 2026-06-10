@@ -2,6 +2,8 @@ package com.livecaption
 
 import android.app.Application
 import android.content.Context
+import android.media.projection.MediaProjection
+import android.os.Build
 import android.os.Environment
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
@@ -10,6 +12,8 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.vosk.Recognizer
 import java.io.*
 import java.text.SimpleDateFormat
@@ -30,7 +34,7 @@ import java.util.*
  */
 class CaptionViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val TAG = "CaptionViewModel"
+    private val TAG = "LC_CaptionViewModel"
 
     // ── UI state ──────────────────────────────────────────────────────────────
     private val _caption         = MutableStateFlow("")
@@ -60,10 +64,24 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
     private val historyLinesMutable = ArrayDeque<String>()
 
     // ── Recording state — mirrors recMu / recBuffer / recTicker in main.go ──
-    private val recMutex   = kotlinx.coroutines.sync.Mutex()
+    private val recMutex   = Mutex()
     private val recBuffer  = StringBuilder()
     private var recTmpPath: File? = null
     private var autoSaveJob: Job? = null
+
+    // ── Audio source (mic vs device playback) ────────────────────────────────
+    private val _audioSource = MutableStateFlow(AudioSourceType.MIC)
+    val audioSource: StateFlow<AudioSourceType> = _audioSource.asStateFlow()
+
+    /** Set by OverlayService: launches the MediaProjection consent flow. */
+    var onRequestProjection: (() -> Unit)? = null
+
+    /** Held while in DEVICE mode so we can stop it on switch-back / teardown. */
+    private var mediaProjection: MediaProjection? = null
+
+    /** Silence watchdog for DEVICE mode (detects capture-blocked apps). */
+    private var silenceWatchdogJob: Job? = null
+    @Volatile private var peakRmsSinceSwitch = 0f
 
     // ── STT engine & audio ────────────────────────────────────────────────────
     // audioCapture is lateinit so it can be constructed in init{} after voskEngine
@@ -79,63 +97,69 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         // ── Wire voskEngine callbacks ────────────────────────────────────────
-        // Done here (not in an apply{} block on the class-level val) so that
-        // audioCapture is guaranteed constructed before any callback fires.
         voskEngine.onModelReady = { lang ->
-            _modelReady.value       = true
-            _currentLang.value      = lang
-            _downloadProgress.value = -1
-            _statusMsg.value        = "Listening in $lang…"
-            _caption.value          = ""
-
-            // Reset word state on language switch — mirrors model_ready in JS
-            permanentWords.clear()
-            historyLinesMutable.clear()
-            _historyLines.value = emptyList()
-
-            // Start audio only after model is ready — audioCapture is always
-            // initialized before this callback can fire because loadDefaultModel()
-            // is called at the bottom of this init{} block.
-            audioCapture.start()
+            // onModelReady fires on Dispatchers.IO (inside ModelManager.loadModel).
+            // audioCapture.start() constructs AudioRecord which needs the main thread
+            // on many Android versions. Marshal everything to Main.
+            viewModelScope.launch(Dispatchers.Main) {
+                _modelReady.value       = true
+                _currentLang.value      = lang
+                _downloadProgress.value = -1
+                _statusMsg.value        = "Listening in $lang…"
+                _caption.value          = ""
+                permanentWords.clear()
+                historyLinesMutable.clear()
+                _historyLines.value = emptyList()
+                Log.i(TAG, "Model ready: $lang — starting audio capture (source=${_audioSource.value})")
+                startActiveSource()
+            }
         }
         voskEngine.onDownloadProgress = { lang, pct ->
-            _downloadProgress.value = pct
-            _statusMsg.value = if (pct >= 100)
-                "Extracting $lang model…"
-            else
-                "Downloading $lang model… $pct%"
+            viewModelScope.launch(Dispatchers.Main) {
+                _downloadProgress.value = pct
+                _statusMsg.value = if (pct >= 100) "Extracting $lang model…"
+                else "Downloading $lang model… $pct%"
+            }
         }
         voskEngine.onError = { msg ->
-            _statusMsg.value = msg
-            _downloadProgress.value = -1
-            showToast(msg, isError = true)
+            viewModelScope.launch(Dispatchers.Main) {
+                _statusMsg.value = msg
+                _downloadProgress.value = -1
+                showToast(msg, isError = true)
+            }
         }
-        voskEngine.onResult = { result -> handleCaptionResult(result) }
+        // onResult fires on Dispatchers.IO — marshal to Main for thread-safe
+        // ArrayDeque access (permanentWords, historyLinesMutable are not thread-safe)
+        voskEngine.onResult = { result ->
+            viewModelScope.launch(Dispatchers.Main) {
+                handleCaptionResult(result)
+            }
+        }
 
         // ── Construct audioCapture ───────────────────────────────────────────
-        // Explicit parameter type annotations on the lambdas resolve the
-        // inference recursion that produced:
-        //   "Type checking has run into a recursive problem"
-        //   "Unresolved reference: acceptChunk"
+        // onChunk is a plain (non-suspend) lambda — AudioCapture uses a channel
+        // internally to decouple the read loop from Vosk inference.
         audioCapture = AudioCapture(
             onChunk = { samples: FloatArray ->
-                voskEngine.acceptChunk(samples)
+                voskEngine.acceptChunkSync(samples)
             },
             onLevel = { rms: Float ->
                 _audioLevel.value = rms
+                if (rms > peakRmsSinceSwitch) peakRmsSinceSwitch = rms
             }
         )
 
-        // ── Kick off default model load ──────────────────────────────────────
-        // Mirrors the startup goroutine in main.go.
         voskEngine.loadDefaultModel()
     }
 
     override fun onCleared() {
         super.onCleared()
         // Mirror OnShutdown in main.go:
-        // 1. Stop audio device (no more callbacks)
+        // 1. Stop audio device (no more callbacks) + release projection
+        silenceWatchdogJob?.cancel()
         audioCapture.stop()
+        mediaProjection?.stop()
+        mediaProjection = null
         // 2. Flush any in-progress recording
         viewModelScope.launch { autoSaveTranscript() }
         // 3. Shutdown engine (frees model + recognizer)
@@ -154,6 +178,95 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
         _downloadProgress.value = 0
         _statusMsg.value     = "Loading $lang model…"
         voskEngine.switchLanguage(lang)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Audio source switching (mic ↔ device playback)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Toggle between MIC and DEVICE capture. Called by the toggle button.
+     * MIC → DEVICE requires the MediaProjection consent dialog every session,
+     * so it routes through onRequestProjection (OverlayService launches the
+     * trampoline activity). DEVICE → MIC switches immediately.
+     */
+    fun toggleAudioSource() {
+        if (_audioSource.value == AudioSourceType.MIC) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                showToast("Device audio capture requires Android 10 or newer.", isError = true)
+                return
+            }
+            Log.i(TAG, "toggleAudioSource: requesting projection consent")
+            onRequestProjection?.invoke()
+        } else {
+            switchToMic()
+        }
+    }
+
+    /**
+     * Called by OverlayService after the user grants MediaProjection consent.
+     * The service has already upgraded its foreground type to mediaProjection.
+     */
+    fun switchToDevice(projection: MediaProjection) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        viewModelScope.launch(Dispatchers.Main) {
+            Log.i(TAG, "switchToDevice()")
+            audioCapture.stop()
+            mediaProjection?.stop()
+            mediaProjection = projection
+
+            peakRmsSinceSwitch = 0f
+            audioCapture.startDevice(projection)
+            _audioSource.value = AudioSourceType.DEVICE
+            showToast("Capturing device audio. Apps like Netflix or calls may block capture.")
+
+            // Silence watchdog: if nothing meaningful arrives within 6s while
+            // audio is presumably playing, the source app has almost certainly
+            // opted out of capture — tell the user so it doesn't look broken.
+            silenceWatchdogJob?.cancel()
+            silenceWatchdogJob = viewModelScope.launch {
+                delay(6_000)
+                if (_audioSource.value == AudioSourceType.DEVICE && peakRmsSinceSwitch < 0.001f) {
+                    Log.w(TAG, "Device capture silent for 6s (peak=${peakRmsSinceSwitch})")
+                    showToast(
+                        "No audio detected. The playing app may not allow capture " +
+                                "(e.g. Netflix, Spotify, phone calls).",
+                        isError = true
+                    )
+                }
+            }
+        }
+    }
+
+    /** Switch back to microphone capture, releasing the projection. */
+    fun switchToMic() {
+        viewModelScope.launch(Dispatchers.Main) {
+            Log.i(TAG, "switchToMic()")
+            silenceWatchdogJob?.cancel()
+            silenceWatchdogJob = null
+            audioCapture.stop()
+            mediaProjection?.stop()
+            mediaProjection = null
+            peakRmsSinceSwitch = 0f
+            audioCapture.startMic()
+            _audioSource.value = AudioSourceType.MIC
+        }
+    }
+
+    /** (Re)start whichever source is currently selected. Used after model swaps. */
+    private fun startActiveSource() {
+        val proj = mediaProjection
+        if (_audioSource.value == AudioSourceType.DEVICE &&
+            proj != null &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+        ) {
+            peakRmsSinceSwitch = 0f
+            audioCapture.startDevice(proj)
+        } else {
+            // Projection lost or mic selected — fall back to mic and sync state.
+            _audioSource.value = AudioSourceType.MIC
+            audioCapture.startMic()
+        }
     }
 
     /** Start recording — mirrors recording_started event in main.go. */
@@ -253,6 +366,9 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleCaptionResult(result: CaptionResult) {
+        Log.i(TAG, "handleCaptionResult: isFinal=${result.isFinal} text='${result.text}' " +
+                "thread=${Thread.currentThread().name}")
+
         val rawText = result.text.trim()
         if (rawText.isEmpty()) return
 
@@ -288,10 +404,12 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
             _caption.value = permanentWords.let { dq ->
                 dq.drop(maxOf(0, dq.size - 40)).joinToString(" ")
             }
+            Log.i(TAG, "Caption updated (final): '${_caption.value}'")
         } else {
             // Partial — combine permanent + partial, show last 40 words
             val combined: List<String> = (permanentWords.toList() + partialWords)
             _caption.value = combined.drop(maxOf(0, combined.size - 40)).joinToString(" ")
+            Log.i(TAG, "Caption updated (partial): '${_caption.value}'")
         }
     }
 
@@ -426,10 +544,4 @@ sealed class FileTranscribeState {
     data class Running(val done: Int, val total: Int) : FileTranscribeState()
     data class Done(val file: File) : FileTranscribeState()
     data class Error(val message: String) : FileTranscribeState()
-}
-
-// ── Mutex extension ───────────────────────────────────────────────────────────
-private suspend fun <T> kotlinx.coroutines.sync.Mutex.withLock(block: suspend () -> T): T {
-    lock()
-    return try { block() } finally { unlock() }
 }

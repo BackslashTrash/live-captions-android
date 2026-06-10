@@ -4,8 +4,11 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Required on API 34+ for a foreground service that holds a MediaProjection
+         (device audio capture). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission
         android:name="android.permission.READ_MEDIA_AUDIO"
         android:minSdkVersion="33" />
@@ -14,7 +17,6 @@
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -22,8 +24,8 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.LiveCaption">
-        <activity
 
+        <activity
             android:name=".MainActivity"
             android:exported="true"
             android:theme="@style/Theme.LiveCaption"
@@ -33,15 +35,30 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
         <activity
             android:name=".FilePickerActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:launchMode="singleTop" />
-        <service
-            android:name="OverlayService"
+
+        <!-- Transparent trampoline hosting the MediaProjection consent dialog
+             ("Start recording or casting?") on behalf of OverlayService. -->
+        <activity
+            android:name=".MediaProjectionActivity"
             android:exported="false"
-            android:foregroundServiceType="microphone" />
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:launchMode="singleTop" />
+
+        <!-- foregroundServiceType now includes mediaProjection: on API 34+ a type
+             can only be activated at runtime if it is declared here. The service
+             starts with microphone only and upgrades to microphone|mediaProjection
+             while a device-audio session is active. -->
+        <service
+            android:name=".OverlayService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|mediaProjection" />
+
     </application>
 
 </manifest>

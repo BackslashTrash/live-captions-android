@@ -64,6 +64,7 @@ fun CaptionBar(
     val historyLines by viewModel.historyLines.collectAsState()
     val toastEvent  by viewModel.toastEvent.collectAsState()
     val fileState   by viewModel.fileTranscribeState.collectAsState()
+    val audioSource by viewModel.audioSource.collectAsState()
 
     var historyOpen by remember { mutableStateOf(false) }
 
@@ -177,6 +178,8 @@ fun CaptionBar(
                         text = when {
                             dlProgress in 0..99 -> "Downloading… $dlProgress%"
                             dlProgress == 100   -> "Extracting…"
+                            modelReady && audioSource == AudioSourceType.DEVICE ->
+                                "Live · $currentLang · Device audio"
                             modelReady          -> "Live · $currentLang"
                             else                -> statusMsg
                         },
@@ -186,6 +189,15 @@ fun CaptionBar(
                         modifier      = Modifier.weight(1f)
                     )
                     if (modelReady) LevelMeter(rms = audioLevel)
+                    // Audio source toggle (mic ↔ device playback)
+                    SmallIconButton(
+                        contentDescription = if (audioSource == AudioSourceType.MIC)
+                            "Switch to device audio" else "Switch to microphone",
+                        tint = if (audioSource == AudioSourceType.DEVICE) AccentBlue else TextMuted,
+                        onClick = { viewModel.toggleAudioSource() }
+                    ) {
+                        if (audioSource == AudioSourceType.MIC) MicIcon() else DeviceAudioIcon()
+                    }
                     // History button
                     SmallIconButton(
                         contentDescription = if (historyOpen) "Hide history" else "Show history",
@@ -222,12 +234,36 @@ fun CaptionBar(
                         CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp, color = AccentBlue)
                         Text(statusMsg, fontSize = 18.sp, color = TextPrimary.copy(alpha = 0.6f))
                     }
-                    modelReady -> Text(
-                        text       = caption.ifBlank { "Listening…" },
-                        fontSize   = 22.sp, fontWeight = FontWeight.Medium,
-                        color      = TextPrimary, lineHeight = 31.sp,
-                        maxLines   = 2, overflow = TextOverflow.Ellipsis
-                    )
+                    modelReady -> {
+                        // Fixed-height scrollable caption. Instead of truncating with an
+                        // ellipsis at 2 lines, the text fills a ~3-line box and auto-scrolls
+                        // to the bottom as new words arrive, always showing the latest speech
+                        // (like Google Live Caption). The box height is stable so the overlay
+                        // window doesn't grow/jump as text length changes.
+                        val captionScroll = rememberScrollState()
+                        val captionText   = caption.ifBlank { "Listening…" }
+
+                        // Auto-scroll to the newest text whenever it changes.
+                        LaunchedEffect(captionText) {
+                            captionScroll.animateScrollTo(captionScroll.maxValue)
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 31.dp, max = 96.dp)   // ~1 to ~3 lines at 31sp line height
+                                .verticalScroll(captionScroll)
+                        ) {
+                            Text(
+                                text       = captionText,
+                                fontSize   = 22.sp,
+                                fontWeight = FontWeight.Medium,
+                                color      = TextPrimary,
+                                lineHeight = 31.sp
+                                // no maxLines / no ellipsis — full text, scrolled
+                            )
+                        }
+                    }
                 }
 
                 // File transcription status
@@ -555,4 +591,49 @@ private fun HistoryIcon() {
 private fun RecordIcon(active: Boolean) {
     Box(Modifier.size(10.dp).clip(CircleShape)
         .background(if (active) AccentRed else LocalContentColor.current))
+}
+
+@Composable
+private fun MicIcon() {
+    // Simple mic glyph: capsule head + stem, consistent with the geometric icon style
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(1.dp)
+    ) {
+        Box(
+            Modifier.width(6.dp).height(9.dp)
+                .clip(RoundedCornerShape(3.dp))
+                .background(LocalContentColor.current)
+        )
+        Box(
+            Modifier.width(2.dp).height(3.dp)
+                .background(LocalContentColor.current)
+        )
+    }
+}
+
+@Composable
+private fun DeviceAudioIcon() {
+    // Speaker glyph: small box + emanating bar, drawn geometrically
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Box(
+            Modifier.width(6.dp).height(8.dp)
+                .clip(RoundedCornerShape(1.dp))
+                .background(LocalContentColor.current)
+        )
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Box(Modifier.width(3.dp).height(2.dp)
+                .clip(RoundedCornerShape(1.dp))
+                .background(LocalContentColor.current))
+            Box(Modifier.width(4.dp).height(2.dp)
+                .clip(RoundedCornerShape(1.dp))
+                .background(LocalContentColor.current))
+            Box(Modifier.width(3.dp).height(2.dp)
+                .clip(RoundedCornerShape(1.dp))
+                .background(LocalContentColor.current))
+        }
+    }
 }
