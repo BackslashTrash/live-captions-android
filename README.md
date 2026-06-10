@@ -21,9 +21,9 @@ Built with Kotlin, Jetpack Compose, Vosk, and a three-window WindowManager overl
 ---
 
 ## Screenshots
-<img width="1080" height="2400" alt="1000003752" src="https://github.com/user-attachments/assets/ccdce742-5494-4a98-8b0f-a1690cf56387" />
-<img width="1080" height="2400" alt="1000003751" src="https://github.com/user-attachments/assets/2a34bed0-cc98-41be-a4e3-44611c17199e" />
-<img width="1080" height="2400" alt="1000003750" src="https://github.com/user-attachments/assets/2f34fed3-8a18-4996-8d08-124939fc3301" />
+<img width="480" height="1066" alt="1000003752" src="https://github.com/user-attachments/assets/ccdce742-5494-4a98-8b0f-a1690cf56387" />
+<img width="480" height="1066" alt="1000003751" src="https://github.com/user-attachments/assets/2a34bed0-cc98-41be-a4e3-44611c17199e" />
+<img width="480" height="1066" alt="1000003750" src="https://github.com/user-attachments/assets/2f34fed3-8a18-4996-8d08-124939fc3301" />
 
 ---
 
